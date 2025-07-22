@@ -1,255 +1,247 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-A Python script to process a text-based PDF file, extract structured information,
-and generate a CSV with detailed features for each text block, including
-normalized values for size and spacing, and a label for centered text.
-
-This script uses the PyMuPDF library (fitz) to parse the PDF, as it provides
-excellent access to low-level details like font information, bounding boxes,
-and text flags.
-
-Requirements:
-    - PyMuPDF: a.k.a. fitz, can be installed with `pip install PyMuPDF`
-
-Usage:
-    python extract_pdf_features.py <input_pdf_path> <output_csv_path>
-
-Example:
-    python extract_pdf_features.py "reports/annual_report.pdf" "analysis/report_features.csv"
-"""
-
+import sys
 import fitz  # PyMuPDF
 import csv
-import sys
-import os
-from collections import Counter
 
-def analyze_block_text_features(block):
+def convert_color_int_to_rgb(color_int):
     """
-    Analyzes the spans within a text block to determine dominant font properties.
-    
+    Converts an sRGB integer color value to a more readable (R, G, B) tuple.
+
     Args:
-        block (dict): A text block dictionary from page.get_text("dict").
-        
+        color_int (int): The integer representation of the color.
+
     Returns:
-        tuple: A tuple containing (dominant_font, dominant_size, is_bold, is_italic, full_text).
+        tuple: An (R, G, B) tuple, or None if input is invalid.
     """
-    spans_info = []
-    full_text = ""
+    if color_int is None:
+        return None
+    # The color is stored as a single integer, we decode it to R, G, B components
+    blue = color_int & 255
+    green = (color_int >> 8) & 255
+    red = (color_int >> 16) & 255
+    return (red, green, blue)
 
-    # A block is composed of lines, and lines are composed of spans.
-    # A span is a contiguous run of text with the same font, size, and flags.
-    for line in block.get('lines', []):
-        for span in line.get('spans', []):
-            spans_info.append({
-                'size': span.get('size', 0),
-                'font': span.get('font', ''),
-                'flags': span.get('flags', 0),
-            })
-            full_text += span.get('text', '') + ' '
-    
-    full_text = full_text.strip()
-    if not spans_info:
-        return "N/A", 0, False, False, full_text
-
-    # --- Determine dominant font and size ---
-    # Count occurrences of each font and size
-    font_counter = Counter(s['font'] for s in spans_info)
-    size_counter = Counter(round(s['size']) for s in spans_info)
-    
-    dominant_font = font_counter.most_common(1)[0][0] if font_counter else "N/A"
-    dominant_size = size_counter.most_common(1)[0][0] if size_counter else 0
-
-    # --- Determine font styles (bold/italic) ---
-    # PyMuPDF uses flags to denote styles. Flag 2^4=16 is bold, 2^1=2 is italic.
-    flags = [s['flags'] for s in spans_info]
-    is_bold = any(f & (1 << 4) for f in flags)
-    is_italic = any(f & (1 << 1) for f in flags)
-
-    return dominant_font, dominant_size, is_bold, is_italic, full_text
-
-
-def process_pdf(input_pdf_path, output_csv_path):
+def get_style_signature(span):
     """
-    Main function to process the PDF and generate the feature-rich CSV.
-    
+    Creates a unique signature for a text span based on its style properties.
+    This helps in identifying and merging text with identical styling.
+
     Args:
-        input_pdf_path (str): The file path of the input PDF.
-        output_csv_path (str): The file path for the output CSV.
+        span (dict): The span dictionary from PyMuPDF.
+
+    Returns:
+        tuple: A tuple representing the style signature, or None.
     """
+    if not span:
+        return None
+    
+    flags = span.get("flags", 0)
+    # Flag 1 is for underline.
+    is_underline = bool(flags & 1)
+    # Flag 2 is for italic.
+    is_italic = bool(flags & 2)
+    # Flag 16 is for bold.
+    is_bold = bool(flags & 16)
+    
+    # Check if the text is all uppercase.
+    text = span.get("text", "").strip()
+    is_all_caps = text.isupper() and any(c.isalpha() for c in text)
+
+    # The signature is a combination of all relevant style properties.
+    # We round font size to handle minor floating point variations.
+    signature = (
+        span.get("font", "Unknown"),
+        round(span.get("size", 0), 2),
+        span.get("color"),
+        is_bold,
+        is_italic,
+        is_underline,
+        is_all_caps
+    )
+    return signature
+
+def normalize_value(value, min_val, max_val):
+    """
+    Normalizes a value to a 0-1 scale using min-max normalization.
+    """
+    if max_val == min_val:
+        return 0.0  # Avoid division by zero if all values are the same
+    return (value - min_val) / (max_val - min_val)
+
+def extract_and_process_pdf(pdf_path, csv_path):
+    """
+    Performs a two-pass process on a PDF. First, it gathers all text block data
+    to find min/max values for normalization. Second, it calculates normalized
+    values and writes the complete, ML-ready data to a CSV file.
+
+    Args:
+        pdf_path (str): The file path to the PDF document.
+        csv_path (str): The file path for the output CSV file.
+    """
+    doc = None
     try:
-        doc = fitz.open(input_pdf_path)
-    except Exception as e:
-        print(f"Error: Could not open or process PDF file '{input_pdf_path}'.")
-        print(f"Reason: {e}")
-        return
-
-    all_blocks_data = []
-
-    print(f"Processing {len(doc)} pages in '{os.path.basename(input_pdf_path)}'...")
-
-    # Iterate through each page of the PDF
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_height = page.rect.height
-        page_width = page.rect.width
-
-        # Get text blocks from the page, already grouped by layout
-        # Sorting by vertical position (y0) is crucial for calculating space between blocks
-        blocks = sorted(page.get_text("dict")["blocks"], key=lambda b: b['bbox'][1])
-
-        # Iterate through each text block
-        for i, block in enumerate(blocks):
-            # Skip empty or image blocks
-            if block['type'] != 0 or not block.get('lines'):
-                continue
-
-            # --- 1. Basic Text and Font Features ---
-            font, font_size, is_bold, is_italic, text = analyze_block_text_features(block)
-            
-            # Skip blocks with no text content
-            if not text.strip():
-                continue
-
-            # --- 2. Content-based Features ---
-            cleaned_text_for_caps = ''.join(c for c in text if c.isalpha())
-            is_all_caps = bool(cleaned_text_for_caps) and cleaned_text_for_caps.isupper()
-            contains_number = any(char.isdigit() for char in text)
-            contains_fullstop = '.' in text
-            word_count = len(text.split())
-
-            # --- 3. Positional and Bounding Box Features ---
-            x0, y0, x1, y1 = block['bbox']
-
-            # --- 4. Whitespace and Alignment Features ---
-            # Space Above: Distance from the top of this block to the bottom of the previous block.
-            prev_block_y1 = blocks[i-1]['bbox'][3] if i > 0 else 0
-            space_above = y0 - prev_block_y1
-
-            # Space Below: Distance from the bottom of this block to the top of the next block.
-            next_block_y0 = blocks[i+1]['bbox'][1] if i < len(blocks) - 1 else page_height
-            space_below = next_block_y0 - y1
-            
-            # Space on Left/Right
-            space_left = x0
-            space_right = page_width - x1
-            
-            # **NEW**: Centering check with a margin of error
-            page_midpoint_x = page_width / 2
-            block_midpoint_x = (x0 + x1) / 2
-            margin_of_error = 5.0  # in points (1/72 inch). Adjust this value as needed.
-            is_centered = abs(block_midpoint_x - page_midpoint_x) < margin_of_error
-
-            # --- 5. Underline Detection (Advanced) ---
-            # Search for horizontal drawing paths near the text's baseline.
-            is_underline = False
-            drawings = page.get_drawings()
-            for path in drawings:
-                # Check for a horizontal line by ensuring its bounding box has a very small height.
-                is_horizontal_line = path['rect'].height < 1.0 and path['rect'].width > 0
-
-                if is_horizontal_line:
-                    # Check if the line's vertical position is near the text block's baseline (y1).
-                    line_y = path['rect'].y0
-                    if line_y > (y1 - font_size * 0.2) and line_y < (y1 + font_size * 0.2):
-                        # Finally, check if the line's horizontal span overlaps with the block's text.
-                        if max(x0, path['rect'].x0) < min(x1, path['rect'].x1):
-                            is_underline = True
-                            break # Found an underline for this block
-
-            # --- Assemble the feature dictionary for this block ---
-            block_data = {
-                'text': text,
-                'font': font,
-                'font_size': font_size,
-                'is_bold': is_bold,
-                'is_italic': is_italic,
-                'is_underline': is_underline,
-                'is_all_caps': is_all_caps,
-                'is_centered': is_centered, # Added new feature
-                'contains_number': contains_number,
-                'contains_fullstop': contains_fullstop,
-                'word_count': word_count,
-                'x0': round(x0, 2),
-                'y0': round(y0, 2),
-                'x1': round(x1, 2),
-                'y1': round(y1, 2),
-                'space_above': round(space_above, 2),
-                'space_below': round(space_below, 2),
-                'space_left': round(space_left, 2),
-                'space_right': round(space_right, 2),
-                'page_number': page_num + 1, # Page numbers are 1-based for human readability
-            }
-            all_blocks_data.append(block_data)
-
-    doc.close()
-
-    if not all_blocks_data:
-        print("Warning: No text blocks were extracted from the PDF.")
-        return
-
-    # --- 6. Normalize features across the entire document ---
-    features_to_normalize = ['font_size', 'space_above', 'space_below', 'space_left', 'space_right']
-    min_max_values = {key: {'min': float('inf'), 'max': float('-inf')} for key in features_to_normalize}
-
-    for block in all_blocks_data:
-        for key in features_to_normalize:
-            min_max_values[key]['min'] = min(min_max_values[key]['min'], block[key])
-            min_max_values[key]['max'] = max(min_max_values[key]['max'], block[key])
-
-    # Second pass: calculate and insert normalized values.
-    for block in all_blocks_data:
-        for key in features_to_normalize:
-            min_val = min_max_values[key]['min']
-            max_val = min_max_values[key]['max']
-            range_val = max_val - min_val
-            
-            # Handle division by zero if all values for a feature are the same.
-            norm_val = 0.0 if range_val == 0 else (block[key] - min_val) / range_val
-            
-            block[f'norm_{key}'] = round(norm_val, 4)
-
-    # --- 7. Write all extracted data to a CSV file ---
-    print(f"Writing {len(all_blocks_data)} text blocks to '{output_csv_path}'...")
-    try:
-        with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-            # Dynamically get headers from the first dictionary's keys
-            if all_blocks_data:
-                fieldnames = all_blocks_data[0].keys()
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-                writer.writeheader()
-                writer.writerows(all_blocks_data)
-        print("Successfully created the CSV file.")
-    except IOError as e:
-        print(f"Error: Could not write to CSV file '{output_csv_path}'.")
-        print(f"Reason: {e}")
-
-
-def main():
-    """
-    Entry point of the script. Parses command-line arguments.
-    """
-    if len(sys.argv) != 3:
-        print("Usage: python extract_pdf_features.py <input_pdf_path> <output_csv_path>")
-        sys.exit(1)
-
-    input_pdf = sys.argv[1]
-    output_csv = sys.argv[2]
-
-    if not os.path.exists(input_pdf):
-        print(f"Error: Input file not found at '{input_pdf}'")
-        sys.exit(1)
+        doc = fitz.open(pdf_path)
+        print(f"Successfully opened '{pdf_path}'")
+        print(f"Number of pages: {doc.page_count}\n")
+        print("-" * 30)
         
-    output_dir = os.path.dirname(output_csv)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created output directory: '{output_dir}'")
+        # --- PASS 1: Gather all data to determine normalization ranges ---
+        print("Starting Pass 1: Analyzing document structure...")
+        all_blocks_raw_data = []
+        for page_num, page in enumerate(doc, 1):
+            page_width = page.rect.width
+            page_height = page.rect.height
+            
+            blocks = page.get_text("dict").get("blocks", [])
+            if not blocks:
+                continue
 
-    process_pdf(input_pdf, output_csv)
+            # Merge lines with identical styles for the current page
+            merged_blocks_on_page = []
+            current_text = ""
+            current_style_sig = None
+            current_bbox = None
 
+            for block in blocks:
+                if block['type'] == 0:  # Text block
+                    for line in block.get("lines", []):
+                        spans = line.get("spans", [])
+                        if not spans: continue
+                        
+                        longest_span = max(spans, key=lambda s: len(s.get("text", "").strip()), default=None)
+                        if not longest_span or not longest_span.get("text", "").strip(): continue
 
-if __name__ == '__main__':
-    main()
+                        line_style_sig = get_style_signature(longest_span)
+                        line_text = "".join(span.get("text", "") for span in spans).strip()
+                        line_bbox = fitz.Rect(line["bbox"])
+
+                        if line_style_sig == current_style_sig:
+                            current_text += " " + line_text
+                            current_bbox.include_rect(line_bbox)
+                        else:
+                            if current_text:
+                                merged_blocks_on_page.append({"text": current_text, "style": current_style_sig, "bbox": current_bbox})
+                            current_style_sig = line_style_sig
+                            current_text = line_text
+                            current_bbox = fitz.Rect(line_bbox)
+            
+            if current_text:
+                merged_blocks_on_page.append({"text": current_text, "style": current_style_sig, "bbox": current_bbox})
+
+            # Calculate raw spacing values for the page and store all data
+            for i, block_data in enumerate(merged_blocks_on_page):
+                block_data['page_num'] = page_num
+                block_data['page_width'] = page_width
+                block_data['page_height'] = page_height
+                
+                # Calculate raw space values
+                bbox = block_data["bbox"]
+                block_data['space_left'] = bbox.x0
+                block_data['space_right'] = page_width - bbox.x1
+                block_data['space_above'] = bbox.y0 if i == 0 else bbox.y0 - merged_blocks_on_page[i-1]["bbox"].y1
+                block_data['space_below'] = page_height - bbox.y1 if i == len(merged_blocks_on_page) - 1 else merged_blocks_on_page[i+1]["bbox"].y0 - bbox.y1
+                
+                all_blocks_raw_data.append(block_data)
+
+        if not all_blocks_raw_data:
+            print("No text content found in the PDF.")
+            return
+
+        # --- Calculate Min/Max for normalization ---
+        font_sizes = [b['style'][1] for b in all_blocks_raw_data]
+        spaces_above = [b['space_above'] for b in all_blocks_raw_data]
+        spaces_below = [b['space_below'] for b in all_blocks_raw_data]
+        spaces_left = [b['space_left'] for b in all_blocks_raw_data]
+        spaces_right = [b['space_right'] for b in all_blocks_raw_data]
+
+        min_font, max_font = min(font_sizes), max(font_sizes)
+        min_sa, max_sa = min(spaces_above), max(spaces_above)
+        min_sb, max_sb = min(spaces_below), max(spaces_below)
+        min_sl, max_sl = min(spaces_left), max(spaces_left)
+        min_sr, max_sr = min(spaces_right), max(spaces_right)
+        
+        # --- PASS 2: Normalize data and write to CSV ---
+        print("Starting Pass 2: Normalizing data and writing to CSV...")
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            csv_writer = csv.writer(csvfile)
+            # Reordered header with ML-relevant columns first
+            csv_writer.writerow([
+                'page_number', 'is_bold', 'is_italic', 'is_underline', 'is_all_caps', 
+                'is_centered', 'contains_number', 'contains_fullstop', 'word_count', 
+                'norm_font_size', 'norm_space_above', 'norm_space_below', 
+                'norm_space_left', 'norm_space_right', 'norm_r', 'norm_g', 'norm_b', 
+                'norm_x0', 'norm_y0', 'norm_x1', 'norm_y1', 
+                'font', 'font_size', 'color_rgb', 'x0', 'y0', 'x1', 'y1', 
+                'space_above', 'space_below', 'space_left', 'space_right', 'text'
+            ])
+
+            for block_data in all_blocks_raw_data:
+                text = block_data["text"]
+                style = block_data["style"]
+                bbox = block_data["bbox"]
+                font, size, color_int, bold, italic, underline, all_caps = style
+                
+                # Normalize positional and style values
+                norm_font_size = normalize_value(size, min_font, max_font)
+                norm_sa = normalize_value(block_data['space_above'], min_sa, max_sa)
+                norm_sb = normalize_value(block_data['space_below'], min_sb, max_sb)
+                norm_sl = normalize_value(block_data['space_left'], min_sl, max_sl)
+                norm_sr = normalize_value(block_data['space_right'], min_sr, max_sr)
+                
+                # Normalize coordinates by page dimensions
+                page_width = block_data['page_width']
+                page_height = block_data['page_height']
+                norm_x0 = bbox.x0 / page_width if page_width else 0
+                norm_y0 = bbox.y0 / page_height if page_height else 0
+                norm_x1 = bbox.x1 / page_width if page_width else 0
+                norm_y1 = bbox.y1 / page_height if page_height else 0
+
+                # Other properties
+                contains_number = any(char.isdigit() for char in text)
+                contains_fullstop = '.' in text
+                word_count = len(text.split())
+                is_centered = abs(block_data['space_left'] - block_data['space_right']) < 5
+                
+                # Color conversion and normalization
+                color_rgb = convert_color_int_to_rgb(color_int)
+                if color_rgb:
+                    color_str = f"({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]})"
+                    norm_r = color_rgb[0] / 255.0
+                    norm_g = color_rgb[1] / 255.0
+                    norm_b = color_rgb[2] / 255.0
+                else:
+                    color_str = "(0, 0, 0)"
+                    norm_r, norm_g, norm_b = 0.0, 0.0, 0.0
+
+                # Write the final row in the new order
+                csv_writer.writerow([
+                    block_data['page_num'], int(bold), int(italic), int(underline), int(all_caps),
+                    int(is_centered), int(contains_number), int(contains_fullstop), word_count,
+                    round(norm_font_size, 4), round(norm_sa, 4), round(norm_sb, 4),
+                    round(norm_sl, 4), round(norm_sr, 4),
+                    round(norm_r, 4), round(norm_g, 4), round(norm_b, 4),
+                    round(norm_x0, 4), round(norm_y0, 4), round(norm_x1, 4), round(norm_y1, 4),
+                    font, size, color_str, 
+                    round(bbox.x0, 2), round(bbox.y0, 2), round(bbox.x1, 2), round(bbox.y1, 2),
+                    round(block_data['space_above'], 2), round(block_data['space_below'], 2), 
+                    round(block_data['space_left'], 2), round(block_data['space_right'], 2), 
+                    text
+                ])
+
+    except FileNotFoundError:
+        print(f"Error: The file '{pdf_path}' was not found.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if doc:
+            doc.close()
+            print("\n" + "-" * 30)
+            print("Processing complete. Document closed.")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python your_script_name.py <path_to_pdf_file> <output_csv_file>")
+        sys.exit(1)
+
+    pdf_file_path = sys.argv[1]
+    csv_file_path = sys.argv[2]
+    extract_and_process_pdf(pdf_file_path, csv_file_path)
